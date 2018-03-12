@@ -21,11 +21,11 @@
 
 #include "modules/common/log.h"
 #include "modules/common/util/file.h"
+#include "include/region_output.h"
 #include "modules/perception/common/perception_gflags.h"
 #include "modules/perception/obstacle/camera/common/util.h"
 #include "modules/perception/obstacle/camera/detector/common/feature_extractor.h"
 #include "modules/perception/obstacle/camera/detector/yolo_camera_detector/proto/yolo.pb.h"
-#include "modules/perception/obstacle/camera/detector/yolo_camera_detector/region_output.h"
 #include "modules/perception/obstacle/camera/detector/yolo_camera_detector/util.h"
 #include "modules/perception/obstacle/camera/interface/base_camera_detector.h"
 
@@ -260,7 +260,7 @@ TEST(YoloCameraDetectorTest, nms_test) {
 
 TEST_F(YoloCameraDetectorTest, input_tensor_test) {
   const std::string yolo_config =
-      "/apollo/modules/perception/model/yolo_camera_detector/config_test.pt";
+      "/apollo/modules/perception/model/yolo_camera_detector/config.pt";
 
   YoloParam yolo_param;
   CHECK(GetProtoFromASCIIFile(yolo_config, &yolo_param));
@@ -271,7 +271,7 @@ TEST_F(YoloCameraDetectorTest, input_tensor_test) {
     BaseCameraDetector *camera_detector =
         BaseCameraDetectorRegisterer::GetInstanceByName("YoloCameraDetector");
     CHECK_NOTNULL(camera_detector);
-    // CHECK(camera_detector->Init());
+    CHECK(camera_detector->Init());
   }
   // Recover to origin config.
   CHECK(SetProtoToASCIIFile(origin_yolo_param, yolo_config));

@@ -1,6 +1,6 @@
 model_param {
   model_name: "yolo3d_1128"
-  weight_file: "CAFFE.anakin.bin"
+  weight_file: "deploy.md"
   offset_ratio: 0.36423841
   confidence_threshold: 0.5
   min_2d_height: 25

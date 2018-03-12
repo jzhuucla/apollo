@@ -21,6 +21,8 @@
 #include <map>
 #include <string>
 
+#include "opencv2/opencv.hpp"
+
 #include "modules/common/log.h"
 
 namespace apollo {
@@ -84,6 +86,40 @@ bool load_anchors(const string &path, vector<float> *anchors) {
   }
   ifs.close();
   return true;
+}
+
+void recover_bbox(int roi_w, int roi_h, int offset_y,
+                  std::vector<VisualObjectPtr> *objects) {
+  for (auto &obj : *objects) {
+    float xmin = obj->upper_left[0];
+    float ymin = obj->upper_left[1];
+    float xmax = obj->lower_right[0];
+    float ymax = obj->lower_right[1];
+    int x = xmin * roi_w;
+    int w = (xmax - xmin) * roi_w;
+    int y = ymin * roi_h + offset_y;
+    int h = (ymax - ymin) * roi_h;
+    cv::Rect rect_det(x, y, w, h);
+    cv::Rect rect_img(0, 0, roi_w, roi_h + offset_y);
+    cv::Rect rect = rect_det & rect_img;
+    obj->upper_left[0] = rect.x;
+    obj->upper_left[1] = rect.y;
+    obj->lower_right[0] = rect.x + rect.width;
+    obj->lower_right[1] = rect.y + rect.height;
+    double eps = 1e-2;
+
+    // Truncation assignment based on bbox positions
+    if ((ymin < eps) || (ymax >= 1.0 - eps)) {
+      obj->trunc_height = 0.5;
+    } else {
+      obj->trunc_height = 0.0;
+    }
+    if ((xmin < eps) || (xmax >= 1.0 - eps)) {
+      obj->trunc_width = 0.5;
+    } else {
+      obj->trunc_width = 0.0;
+    }
+  }
 }
 
 }  // namespace yolo

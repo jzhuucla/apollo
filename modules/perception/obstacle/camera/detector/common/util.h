@@ -19,7 +19,6 @@
 #include <memory>
 
 #include "caffe/caffe.hpp"
-#include "include/undistortion.h"
 
 #include "modules/common/log.h"
 
@@ -28,21 +27,21 @@ namespace perception {
 void gpu_memcpy(const size_t N, const void *X, void *Y);
 
 inline void perception_gpu_memset(const size_t N, const int alpha, void *X) {
-  //  CUDA_CHECK(cudaMemset(X, alpha, N));
+  CUDA_CHECK(cudaMemset(X, alpha, N));
 }
 inline void perception_memset(const size_t N, const int alpha, void *X) {
   memset(X, alpha, N);
 }
 
 inline void PerceptionMallocHost(void **ptr, size_t size, bool *use_cuda) {
-  //  CUDA_CHECK(cudaMallocHost(ptr, size));
+  CUDA_CHECK(cudaMallocHost(ptr, size));
   *use_cuda = true;
   return;
 }
 
 inline void PerceptionFreeHost(void *ptr, bool use_cuda) {
   if (use_cuda) {
-    //    CUDA_CHECK(cudaFreeHost(ptr));
+    CUDA_CHECK(cudaFreeHost(ptr));
     return;
   }
   free(ptr);

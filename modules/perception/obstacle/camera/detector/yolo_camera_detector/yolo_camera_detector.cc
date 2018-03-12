@@ -16,11 +16,12 @@
 
 #include "modules/perception/obstacle/camera/detector/yolo_camera_detector/yolo_camera_detector.h"
 
+#include <cmath>
+
 #include "modules/common/util/file.h"
 #include "modules/perception/common/perception_gflags.h"
 #include "modules/perception/obstacle/camera/common/util.h"
 #include "modules/perception/obstacle/camera/detector/common/proto/tracking_feature.pb.h"
-#include "modules/perception/obstacle/camera/detector/common/util.h"
 #include "modules/perception/obstacle/camera/detector/yolo_camera_detector/util.h"
 
 DEFINE_string(yolo_config_filename, "config.pt", "Yolo config filename.");
@@ -30,6 +31,7 @@ namespace perception {
 
 using std::string;
 using std::vector;
+using std::map;
 
 bool YoloCameraDetector::Init(const CameraDetectorInitOptions &options) {
   ConfigManager *config_manager = ConfigManager::instance();
@@ -88,13 +90,22 @@ void YoloCameraDetector::init_anchor(const string &yolo_root) {
   yolo::load_types(types_file, &types_);
   // res_box_tensor_.reset(new anakin::Tensor<float>());
   // res_box_tensor_->Reshape(1, 1, obj_size_, s_box_block_size);
+  res_box_tensor_.reset(
+      new SyncedMemory(obj_size_ * s_box_block_size * sizeof(float)));
+  res_box_tensor_->cpu_data();
+  res_box_tensor_->gpu_data();
 
   // res_cls_tensor_.reset(new anakin::Tensor<float>());
   // res_cls_tensor_->Reshape(1, 1, types_.size(), obj_size_);
+  res_cls_tensor_.reset(
+      new SyncedMemory(types_.size() * obj_size_ * sizeof(float)));
+  res_cls_tensor_->cpu_data();
+  res_cls_tensor_->gpu_data();
 
   overlapped_.reset(new SyncedMemory(top_k_ * top_k_ * sizeof(bool)));
   overlapped_->cpu_data();
   overlapped_->gpu_data();
+
   idx_sm_.reset(new SyncedMemory(top_k_ * sizeof(int)));
   idx_sm_->cpu_data();
   idx_sm_->gpu_data();
@@ -166,6 +177,11 @@ bool YoloCameraDetector::init_cnn(const string &yolo_root) {
   string feature_file =
       apollo::common::util::GetAbsolutePath(
           model_root, model_param.feature_file());
+
+  AINFO << "[Debug] proto_file: " << proto_file;
+  AINFO << "[Debug] weight_file: " << weight_file;
+  AINFO << "[Debug] model_root: " << model_root;
+  AINFO << "[Debug] feature_file: " << feature_file;
 
   const auto &model_type = model_param.model_type();
 
@@ -294,7 +310,6 @@ bool YoloCameraDetector::Detect(const cv::Mat &frame,
       cnnadapter_->get_blob_by_name(yolo_param_.net_param().input_blob());
   if (roi_w == frame.cols && roi_h == frame.rows) {
     resize(frame, input_blob.get(), image_data_, 0);
-
   } else {
     resize(frame(roi), input_blob.get(), image_data_, 0);
   }
@@ -305,13 +320,14 @@ bool YoloCameraDetector::Detect(const cv::Mat &frame,
   caffe::Timer det_time;
   det_time.Start();
   cnnadapter_->forward();
-  AINFO << "Running detection_: " << det_time.MilliSeconds() << " ms";
+  AINFO << "Running detection: " << det_time.MilliSeconds() << " ms";
   caffe::Timer post_time;
   post_time.Start();
 
   vector<VisualObjectPtr> temp_objects;
 
-  get_objects_gpu(&temp_objects);
+  // get_objects_gpu(&temp_objects);
+  get_objects_cpu(&temp_objects);
 
   AINFO << "object size" << temp_objects.size();
   for (int i = 0; i < static_cast<int>(temp_objects.size()); ++i) {
@@ -354,7 +370,7 @@ bool YoloCameraDetector::Detect(const cv::Mat &frame,
   AINFO << "Number of detected obstacles: " << objects->size();
 
   Extract(objects);
-  recover_bbox(roi_w, roi_h, offset_y_, objects);
+  yolo::recover_bbox(roi_w, roi_h, offset_y_, objects);
 
   int det_id = 0;
   for (auto &obj : *objects) {
@@ -371,10 +387,255 @@ bool YoloCameraDetector::Detect(const cv::Mat &frame,
 
 string YoloCameraDetector::Name() const { return "YoloCameraDetector"; }
 
-bool YoloCameraDetector::get_objects_gpu(
+bool YoloCameraDetector::get_objects_cpu(
     std::vector<VisualObjectPtr> *objects) {
-  AFATAL << "Not implemented, yet!";
-  return false;
+  int num_classes = types_.size();
+  auto loc_blob = cnnadapter_->get_blob_by_name(
+      yolo_param_.net_param().loc_blob());
+  auto obj_blob = cnnadapter_->get_blob_by_name(
+      yolo_param_.net_param().obj_blob());
+  auto cls_blob = cnnadapter_->get_blob_by_name(
+      yolo_param_.net_param().cls_blob());
+  auto dim_blob = cnnadapter_->get_blob_by_name(
+      yolo_param_.net_param().dim_blob());
+  auto ori_blob = cnnadapter_->get_blob_by_name(
+      yolo_param_.net_param().ori_blob());
+  auto lof_blob = cnnadapter_->get_blob_by_name(
+      yolo_param_.net_param().lof_blob());
+  auto lor_blob = cnnadapter_->get_blob_by_name(
+      yolo_param_.net_param().lor_blob());
+
+  int batch = obj_blob->num();
+  int height = obj_blob->channels();
+  int width = obj_blob->height();
+  CHECK_EQ(batch, 1) << "batch size should be 1!";
+  const float *loc_data = loc_blob->cpu_data();
+  const float *obj_data = obj_blob->cpu_data();
+  const float *cls_data = cls_blob->cpu_data();
+
+  bool with_lof = lof_blob != nullptr;
+  bool with_lor = lor_blob != nullptr;
+  bool with_ori = ori_blob != nullptr;
+  bool with_dim = dim_blob != nullptr;
+
+  const float *ori_data = with_ori ? ori_blob->cpu_data() : nullptr;
+  const float *dim_data = with_dim ? dim_blob->cpu_data() : nullptr;
+  const float *lof_data = with_lof ? lof_blob->cpu_data() : nullptr;
+  const float *lor_data = with_lor ? lor_blob->cpu_data() : nullptr;
+  if (res_box_tensor_ == nullptr ||
+      res_cls_tensor_ == nullptr ||
+      overlapped_ == nullptr) {
+    return false;
+  }
+
+  for (int i = 0; i < obj_size_; ++i) {
+    get_object_helper(i, loc_data, obj_data, cls_data, ori_data,
+                      dim_data, lof_data, lor_data,
+                      width, height, num_classes,
+                      with_ori, with_dim, with_lof, with_lor);
+  }
+
+  /*
+  float *res_box_data = res_box_tensor_->mutable_cpu_data();
+  float *res_cls_data = res_cls_tensor_->mutable_cpu_data();
+
+  const int thread_size = 512;
+  {
+    int block_size = (obj_size_ + thread_size - 1) / thread_size;
+    get_object_kernel << < block_size, thread_size >> >
+        (_obj_size, loc_data, obj_data, cls_data, ori_data, dim_data, lof_data, lor_data, (const float *)(_anchor->gpu_data()), width,
+            height, _num_anchors, num_classes, _confidence_threshold, with_ori, with_dim,  with_lof, with_lor, res_box_data, res_cls_data);
+
+  }
+  */
+
+  const float *cpu_cls_data
+      = static_cast<const float*>(res_cls_tensor_->cpu_data());
+
+  map<int, vector<int> > indices;
+  map<int, vector<float> > conf_scores;
+  int num_kept = 0;
+  for (int k = 0; k < num_classes; k++) {
+    apply_nms_gpu(static_cast<const float*>(res_box_tensor_->gpu_data()),
+                  cpu_cls_data + k * obj_size_,
+                  obj_size_, confidence_threshold_,
+                  top_k_, nms_.threshold,
+                  &(indices[static_cast<int>(types_[k])]),
+                  overlapped_, idx_sm_);
+    num_kept += indices[static_cast<int>(types_[k])].size();
+    vector<float> conf_score(cpu_cls_data + k * obj_size_,
+                             cpu_cls_data + (k + 1) * obj_size_);
+    conf_scores.insert(
+        std::make_pair(static_cast<int>(types_[k]), conf_score));
+  }
+  if (num_kept == 0) {
+    AINFO << "Couldn't find any detections";
+    return true;
+  }
+
+  objects->clear();
+  objects->reserve(num_kept);
+  const float* cpu_box_data
+      = static_cast<const float *>(res_box_tensor_->cpu_data());
+
+  for (auto it = indices.begin(); it != indices.end(); ++it) {
+    int label = it->first;
+    if (conf_scores.find(label) == conf_scores.end()) {
+      // Something bad happened if there are no predictions for current label.
+      AFATAL << "Could not find confidence predictions for " << label;
+      continue;
+    }
+
+    const vector<float> &scores = conf_scores.find(label)->second;
+    vector<int> &indice = it->second;
+    for (int j = 0; j < static_cast<int>(indice.size()); ++j) {
+      int idx = indice[j];
+      const float *bbox = cpu_box_data + idx * s_box_block_size;
+      if (scores[idx] < confidence_threshold_) {
+        continue;
+      }
+
+      VisualObjectPtr obj(new VisualObject);
+      obj->type = static_cast<ObjectType>(label);
+      //memset(obj->type_probs, 0, static_cast<int>(ObjectType::MAX_OBJECT_TYPE));
+      obj->type_probs.assign(
+          static_cast<int>(ObjectType::MAX_OBJECT_TYPE), 0.0f);
+      for (int k = 0; k < num_classes; ++k) {
+        int type_k = static_cast<int>(types_[k]);
+        obj->type_probs[type_k] = conf_scores[type_k][idx];
+      }
+      obj->upper_left[0] = bbox[0];
+      obj->upper_left[1] = bbox[1];
+      obj->lower_right[0] = bbox[2];
+      obj->lower_right[1] = bbox[3];
+
+      if (with_ori) {
+        obj->alpha = bbox[4];
+      }
+
+      if (with_dim) {
+        obj->height = bbox[5];
+        obj->width = bbox[6];
+        obj->length = bbox[7];
+      }
+
+      if (with_lof) {
+        obj->front_upper_left[0] = bbox[8];
+        obj->front_upper_left[1] = bbox[9];
+        obj->front_lower_right[0] = bbox[10];
+        obj->front_lower_right[1] = bbox[11];
+      }
+
+      if (with_lor) {
+        obj->back_upper_left[0] = bbox[12];
+        obj->back_upper_left[1] = bbox[13];
+        obj->back_lower_right[0] = bbox[14];
+        obj->back_lower_right[1] = bbox[15];
+      }
+
+      obj->object_feature.clear();
+      objects->push_back(obj);
+    }
+  }
+
+  return true;
+}
+
+void YoloCameraDetector::get_object_helper(int idx,
+                                           const float *loc_data,
+                                           const float *obj_data,
+                                           const float *cls_data,
+                                           const float *ori_data,
+                                           const float *dim_data,
+                                           const float *lof_data,
+                                           const float *lor_data,
+                                           int width,
+                                           int height,
+                                           int num_classes,
+                                           bool with_ori,
+                                           bool with_dim,
+                                           bool with_lof,
+                                           bool with_lor) {
+  float* res_box_data
+      = static_cast<float*>(res_box_tensor_->mutable_cpu_data());
+  float* res_cls_data
+      = static_cast<float*>(res_cls_tensor_->mutable_cpu_data());
+  const float* anchor_data
+      = static_cast<const float*>(anchor_->gpu_data());
+
+  int box_block = s_box_block_size;
+
+  int c = idx % num_anchors_;
+  idx = idx / num_anchors_;
+  int w = idx % width;
+  idx = idx / width;
+  int h = idx;
+  int offset_loc = ((h * width + w) * num_anchors_ + c) * 4;
+  int offset_obj = (h * width + w) * num_anchors_ + c;
+  int offset_cls = ((h * width + w) * num_anchors_ + c) * num_classes;
+  float scale = obj_data[offset_obj];
+  //  printf("%d %d %d %d %d (%d %d %d)| ",
+  //          i, c, w, h, offset_loc, num_anchors_, width, height);
+  float cx = (w + yolo::sigmoid(loc_data[offset_loc + 0])) / width;
+  float cy = (h + yolo::sigmoid(loc_data[offset_loc + 1])) / height;
+  float hw = std::exp(loc_data[offset_loc + 2]) *
+      anchor_data[2 * c] / width * 0.5;
+  float hh = std::exp(loc_data[offset_loc + 3]) *
+      anchor_data[2 * c + 1] / height * 0.5;
+
+  for (int k = 0; k < num_classes; ++k) {
+    float prob = (cls_data[offset_cls + k] * scale > confidence_threshold_ ?
+                  cls_data[offset_cls + k] * scale : 0);
+    //    printf("%f %f | ",prob,cls_data[offset_cls + k] * scale);
+    res_cls_data[k * width * height * num_anchors_ + idx] = prob;
+  }
+  res_box_data[idx * box_block + 0] = cx - hw;
+  res_box_data[idx * box_block + 1] = cy - hh;
+  res_box_data[idx * box_block + 2] = cx + hw;
+  res_box_data[idx * box_block + 3] = cy + hh;
+
+  if (with_ori) {
+    int offset_ori = ((h * width + w) * num_anchors_ + c) * 2;
+    res_box_data[idx * box_block + 4]
+        = std::atan2(ori_data[offset_ori + 1], ori_data[offset_ori]);
+  }
+
+  if (with_dim) {
+    int offset_dim = ((h * width + w) * num_anchors_ + c) * 3;
+    res_box_data[idx * box_block + 5] = dim_data[offset_dim + 0];
+    res_box_data[idx * box_block + 6] = dim_data[offset_dim + 1];
+    res_box_data[idx * box_block + 7] = dim_data[offset_dim + 2];
+  }
+
+  float* dst_ptr = nullptr;
+  const float* src_ptr = nullptr;
+  if (with_lof) {
+    int offset_lof = ((h * width + w) * num_anchors_ + c) * 4;
+    dst_ptr = res_box_data + idx * box_block + 8;
+    src_ptr = lof_data + offset_lof;
+    float sb_x  = src_ptr[0] * hw * 2.0f + cx;
+    float sb_y  = src_ptr[1] * hh * 2.0f + cy;
+    float sb_hw = std::exp(src_ptr[2]) * hw;
+    float sb_hh = std::exp(src_ptr[3]) * hh;
+    dst_ptr[0] = sb_x - sb_hw;
+    dst_ptr[1] = sb_y - sb_hh;
+    dst_ptr[2] = sb_x + sb_hw;
+    dst_ptr[3] = sb_y + sb_hh;
+  }
+
+  if (with_lor) {
+    int offset_lor = ((h * width + w) * num_anchors_ + c) * 4;
+    dst_ptr = res_box_data + idx * box_block + 12;
+    src_ptr = lor_data + offset_lor;
+    float sb_x  = src_ptr[0] * hw * 2.0f + cx;
+    float sb_y  = src_ptr[1] * hh * 2.0f + cy;
+    float sb_hw = std::exp(src_ptr[2]) * hw;
+    float sb_hh = std::exp(src_ptr[3]) * hh;
+    dst_ptr[0] = sb_x - sb_hw;
+    dst_ptr[1] = sb_y - sb_hh;
+    dst_ptr[2] = sb_x + sb_hw;
+    dst_ptr[3] = sb_y + sb_hh;
+  }
 }
 
 }  // namespace perception

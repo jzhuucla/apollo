@@ -2,20 +2,20 @@ load("//tools:cpplint.bzl", "cpplint")
 
 package(default_visibility = ["//visibility:public"])
 
-cc_library(
-    name = "util",
-    srcs = ["util.cc"],
-    hdrs = ["util.h"],
-    deps = [
-        "//modules/common:log",
-        "@caffe//:lib",
-        "@cuda",
-        "@eigen",
-        "@opencv2//:core",
-        "@opencv2//:imgproc",
-        "@undistort",
-    ],
-)
+#cc_library(
+#    name = "util",
+#    srcs = ["util.cc"],
+#    hdrs = ["util.h"],
+#    deps = [
+#        "//modules/common:log",
+#        "@caffe//:lib",
+#        "@cuda",
+#        "@eigen",
+#        "@opencv2//:core",
+#        "@opencv2//:imgproc",
+#        "@perception_util",
+#    ],
+#)
 
 cc_library(
     name = "feature_extractor",
@@ -33,7 +33,7 @@ cc_library(
         "@eigen",
         "@opencv2//:core",
         "@opencv2//:imgproc",
-        "@undistort",
+        "@perception_util",
     ],
 )
 
